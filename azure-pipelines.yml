@@ -1,0 +1,133 @@
+trigger:
+  branches:
+    include:
+      - main
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  pythonVersion: '3.11'
+  vmImageName: 'ubuntu-latest'
+  azureSubscription: 'Azure-Service-Connection'
+  appName: 'hello-world-python-app-2026'
+  resourceGroup: 'rg-hello-world'
+
+stages:
+# ───────────────────────────────────────────────
+# STAGE 1: VALIDATE & BUILD (CI)
+# ───────────────────────────────────────────────
+- stage: Build
+  displayName: 'Build Stage'
+  jobs:
+  - job: BuildJob
+    displayName: 'Build & Package'
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '$(pythonVersion)'
+      displayName: 'Use Python $(pythonVersion)'
+
+    - script: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+      displayName: 'Install dependencies'
+
+    - script: |
+        pip install flake8 pytest
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+      displayName: 'Lint code'
+      continueOnError: true
+
+    - script: |
+        mkdir -p $(Build.ArtifactStagingDirectory)/app
+        cp app.py requirements.txt startup.txt $(Build.ArtifactStagingDirectory)/app/
+      displayName: 'Copy app files to artifact staging'
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)/app'
+        ArtifactName: 'drop'
+        publishLocation: 'Container'
+      displayName: 'Publish Artifact'
+
+# ───────────────────────────────────────────────
+# STAGE 2: INFRASTRUCTURE (TERRAFORM)
+# ───────────────────────────────────────────────
+- stage: Infrastructure
+  displayName: 'Terraform Deploy'
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - job: TerraformJob
+    displayName: 'Provision Azure Infrastructure'
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - task: TerraformInstaller@1
+      inputs:
+        terraformVersion: '1.7.0'
+      displayName: 'Install Terraform'
+
+    - task: TerraformTaskV4@4
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+        backendServiceArm: '$(azureSubscription)'
+        backendAzureRmResourceGroupName: 'tfstate-rg'
+        backendAzureRmStorageAccountName: 'tfstatestorage2026'
+        backendAzureRmContainerName: 'tfstate'
+        backendAzureRmKey: 'hello-world.terraform.tfstate'
+      displayName: 'Terraform Init'
+
+    - task: TerraformTaskV4@4
+      inputs:
+        provider: 'azurerm'
+        command: 'plan'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+        environmentServiceNameAzureRM: '$(azureSubscription)'
+      displayName: 'Terraform Plan'
+
+    - task: TerraformTaskV4@4
+      inputs:
+        provider: 'azurerm'
+        command: 'apply'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+        environmentServiceNameAzureRM: '$(azureSubscription)'
+      displayName: 'Terraform Apply'
+
+# ───────────────────────────────────────────────
+# STAGE 3: DEPLOY APPLICATION (CD)
+# ───────────────────────────────────────────────
+- stage: Deploy
+  displayName: 'Deploy to Azure App Service'
+  dependsOn: Infrastructure
+  condition: succeeded()
+  jobs:
+  - deployment: DeployJob
+    displayName: 'Deploy to App Service'
+    pool:
+      vmImage: $(vmImageName)
+    environment: 'hello-world-production'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: current
+            artifact: 'drop'
+            displayName: 'Download Build Artifact'
+
+          - task: AzureWebApp@1
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              appType: 'webAppLinux'
+              appName: '$(appName)'
+              package: '$(Pipeline.Workspace)/drop'
+              runtimeStack: 'PYTHON|3.11'
+              startupCommand: 'gunicorn --bind=0.0.0.0 --timeout 600 app:app'
+            displayName: 'Deploy to Azure App Service'
